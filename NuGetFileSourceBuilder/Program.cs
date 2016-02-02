@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Reflection.Emit;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 
 namespace NuGetFileSourceBuilder
@@ -34,8 +36,6 @@ namespace NuGetFileSourceBuilder
 
         static void ParseCmdArgs(string[] args)
         {
-
-            
             try
             {
                 cmdArgs = args.Select(s => s.Split('=')).ToDictionary(s => s[0].ToUpper(), s => s[1]);
@@ -45,7 +45,7 @@ namespace NuGetFileSourceBuilder
             }
             catch (Exception e)
             {
-                Console.WriteLine("Invalid arguments exception.\n<ParamName>=<ParamValue>" + e);
+                Console.WriteLine("Invalid arguments exception.\nFormat: \"<ParamName>=<ParamValue> <ParamName>=<ParamValue>\"" + e);
             }
         }
     }
@@ -59,6 +59,9 @@ namespace NuGetFileSourceBuilder
         private string _outputPath;
         private string _nugetPath;
         private List<List<string>> ImportsPaths = new List<List<string>>();
+        private Queue<Process> nugetProcesses = new Queue<Process>();
+        private List<string> nuspecCollection = new List<string>();
+        private ManualResetEvent _signal = new ManualResetEvent(false);
 
         public PackageMaker(string input, string output, string nuget)
         {
@@ -74,7 +77,9 @@ namespace NuGetFileSourceBuilder
                 GetImportsFolders(_inputPath);
                 foreach (var repo in ImportsPaths.SelectMany(repos => repos))
                     GenerateNuspecXml(repo);
-                Console.WriteLine("Completed successfully");
+                Console.WriteLine("Completed successfully\n");
+
+                NuPack();
             }
             catch (Exception ex)
             {
@@ -83,7 +88,61 @@ namespace NuGetFileSourceBuilder
 
         }
 
-        
+        private void NuPack()
+        {
+            foreach (var nuspec in nuspecCollection)
+            {
+                Process process = new Process
+                {
+                    StartInfo =
+                        {
+                            FileName = _nugetPath,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            Arguments = $"pack {nuspec}",
+                            CreateNoWindow = true
+                        },
+                    EnableRaisingEvents = true
+                };
+                process.Exited += ProcExited;
+                nugetProcesses.Enqueue(process);
+            }
+            StartBuild();
+            _signal.WaitOne();
+        }
+
+
+        private void StartBuild()
+        {
+            try
+            {
+                Process proc = nugetProcesses.Dequeue();
+                proc.Start();
+
+                Task.Run(() => ReadOutput(proc));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Failed to launch build:" + ex.Message);
+            }
+        }
+        private void ProcExited(object sender, EventArgs e)
+        {
+            if (nugetProcesses.Count > 0)
+                StartBuild();
+            else
+                _signal.Set();
+
+        }
+
+        private void ReadOutput(Process proc)
+        {
+            string message;
+            while ((message = proc.StandardOutput.ReadLine()) != null)
+            {
+                Console.WriteLine(message);
+            }
+        }
 
         #region ImportsAndFilesLookup
         /// <summary>
@@ -161,8 +220,7 @@ namespace NuGetFileSourceBuilder
                 .GroupBy(f => f)
                 .OrderByDescending(grp => grp.Count())
                 .Select(grp => grp.Key)
-                .First();
-
+                .FirstOrDefault() ?? String.Empty;
 
             yield return new XElement(xmlns + "id", id);
             yield return new XElement(xmlns + "version", version);
@@ -202,11 +260,15 @@ namespace NuGetFileSourceBuilder
 
             string packageName = new DirectoryInfo(importRepoPath).Name;
 
-            Console.WriteLine($"Package {packageName} has been created in {importRepoPath}.");
+            Console.WriteLine($"Package {packageName} has been created in {importRepoPath}.\n");
             if (!Directory.Exists(_outputPath))
                 Directory.CreateDirectory(_outputPath);
 
-            nuspecXml.Save($"{_outputPath}/{packageName}.nuspec");
+            string nuspecFile = $"{_outputPath}/{packageName}.nuspec";
+
+            nuspecCollection.Add(nuspecFile);
+
+            nuspecXml.Save(nuspecFile);
         }
 
         //private void NugetPack
